@@ -37,7 +37,7 @@ class JTLService:
     
     def lookup_rma(self, order_id: str) -> Optional[str]:
         """
-        Look up RMA number (AU number) in JTL system.
+        Look up RMA number (AU number) via direct match in JTL system.
         
         Args:
             order_id: Amazon order ID (external order number)
@@ -54,6 +54,60 @@ class JTLService:
         
         if results and results[0].get('cAuftragsNr'):
             return results[0]['cAuftragsNr'].strip()
+        return None
+    
+    def lookup_rma_by_text_fields(self, order_id: str) -> Optional[str]:
+        """
+        Fallback RMA lookup via text fields (cAnmerkung, cHinweis).
+        
+        For manually re-routed orders where the order ID is stored
+        in the order text fields rather than cExterneAuftragsnummer.
+        
+        Args:
+            order_id: Amazon order ID to search for
+            
+        Returns:
+            JTL AU number (cAuftragsNr) if found, None otherwise
+        """
+        query = """
+            SELECT a.cAuftragsNr
+            FROM Verkauf.tAuftragText t
+            JOIN Verkauf.tAuftrag a ON a.kAuftrag = t.kAuftrag
+            WHERE t.cAnmerkung = ? OR t.cHinweis = ?
+        """
+        results = self.jtl.execute_query(query, (order_id, order_id))
+        
+        if results and results[0].get('cAuftragsNr'):
+            return results[0]['cAuftragsNr'].strip()
+        return None
+    
+    def lookup_rma_enhanced(self, order_id: str) -> Optional[str]:
+        """
+        Two-tier RMA lookup: direct match first, then text fields fallback.
+        
+        This method tries:
+        1. Direct match in tAuftrag.cExterneAuftragsnummer
+        2. Text field match in tAuftragText.cAnmerkung or cHinweis
+        
+        Args:
+            order_id: Amazon order ID
+            
+        Returns:
+            JTL AU number (cAuftragsNr) if found by either method, None otherwise
+        """
+        # Check 1: Direct match in tAuftrag
+        rma = self.lookup_rma(order_id)
+        if rma:
+            logger.info(f"    RMA found via direct match: {rma}")
+            return rma
+        
+        # Check 2: Text field matches
+        rma = self.lookup_rma_by_text_fields(order_id)
+        if rma:
+            logger.info(f"    RMA found via text field match: {rma}")
+            return rma
+        
+        logger.warning(f"    RMA not found in either direct or text field lookup")
         return None
     
     def get_general_order_details(self, order_id: str) -> List[Dict[str, Any]]:
@@ -197,31 +251,108 @@ class JTLService:
         results = self.jtl.execute_query(sql, (order_id,))
         return [self._serialize_dict(r) for r in results]
     
+    def _normalize_to_single(self, items: List[Dict[str, Any]], key_field: str = None) -> List[Dict[str, Any]]:
+        """
+        Normalize a list to contain only one element.
+        
+        Sometimes JTL queries return duplicate rows with the same data.
+        This method takes the first unique record based on key_field,
+        or just the first record if no key_field is specified.
+        
+        Args:
+            items: List of dictionaries
+            key_field: Optional field to use for deduplication
+            
+        Returns:
+            List with at most one element
+        """
+        if not items:
+            return []
+        
+        if key_field and len(items) > 1:
+            # Deduplicate based on key field, keep first occurrence
+            seen = set()
+            unique_items = []
+            for item in items:
+                key = item.get(key_field)
+                if key not in seen:
+                    seen.add(key)
+                    unique_items.append(item)
+            # Return only the first unique item
+            return [unique_items[0]] if unique_items else []
+        
+        # Just return the first item
+        return [items[0]]
+    
+    def _deduplicate_list(self, items: List[Dict[str, Any]], key_fields: List[str]) -> List[Dict[str, Any]]:
+        """
+        Deduplicate a list of dicts based on multiple key fields.
+        
+        Used for product_specs where we want multiple items but no duplicates.
+        
+        Args:
+            items: List of dictionaries
+            key_fields: Fields to use as composite key
+            
+        Returns:
+            Deduplicated list
+        """
+        if not items:
+            return []
+        
+        seen = set()
+        unique_items = []
+        for item in items:
+            key = tuple(item.get(f) for f in key_fields)
+            if key not in seen:
+                seen.add(key)
+                unique_items.append(item)
+        return unique_items
+    
     def get_all_order_data(self, order_id: str) -> Dict[str, Any]:
         """
         Fetch all order data from JTL in one call.
+        
+        Uses enhanced RMA lookup (direct match + text field fallback).
+        Normalizes order details to handle duplicate entries:
+        - general_details: Single element
+        - tracking_info: Single element
+        - product_descriptions: Single element
+        - product_attributes: Single element  
+        - product_specs: Multiple elements allowed (deduplicated)
         
         Args:
             order_id: Amazon order ID
             
         Returns:
             Dict with:
-            - internal_rma: RMA number if found
-            - general_details: Order info
-            - product_descriptions: Product descriptions
-            - product_specs: Specifications
-            - product_attributes: Attributes
-            - tracking_info: Tracking details
+            - internal_rma: RMA number if found (using enhanced lookup)
+            - general_details: Order info (normalized to single)
+            - product_descriptions: Product descriptions (normalized to single)
+            - product_specs: Specifications (multiple, deduplicated)
+            - product_attributes: Attributes (normalized to single)
+            - tracking_info: Tracking details (normalized to single)
         """
         logger.info(f"  Fetching all data for order: {order_id}")
         
+        # Get raw data
+        raw_general = self.get_general_order_details(order_id)
+        raw_descriptions = self.get_product_descriptions(order_id)
+        raw_specs = self.get_product_specs(order_id)
+        raw_attributes = self.get_product_attributes(order_id)
+        raw_tracking = self.get_tracking_info(order_id)
+        
+        # Use enhanced RMA lookup (direct match + text field fallback)
+        internal_rma = self.lookup_rma_enhanced(order_id)
+        
+        # Normalize arrays - take single element for most, dedupe for specs
         data = {
-            "internal_rma": self.lookup_rma(order_id),
-            "general_details": self.get_general_order_details(order_id),
-            "product_descriptions": self.get_product_descriptions(order_id),
-            "product_specs": self.get_product_specs(order_id),
-            "product_attributes": self.get_product_attributes(order_id),
-            "tracking_info": self.get_tracking_info(order_id),
+            "internal_rma": internal_rma,
+            "general_details": self._normalize_to_single(raw_general, "cOrderId"),
+            "product_descriptions": self._normalize_to_single(raw_descriptions, "SKU"),
+            "product_specs": self._deduplicate_list(raw_specs, ["SKU", "Spec_Name", "Spec_Value"]),
+            "product_attributes": self._normalize_to_single(raw_attributes, "SKU"),
+            "tracking_info": self._normalize_to_single(raw_tracking, "Tracking_Number"),
         }
         
         logger.info(f"    RMA: {data['internal_rma'] or 'NOT_FOUND'}")
