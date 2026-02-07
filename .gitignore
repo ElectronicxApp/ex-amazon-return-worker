@@ -36,3 +36,5 @@ amazonCookies.pkl
 # OS
 .DS_Store
 Thumbs.db
+
+Browser/

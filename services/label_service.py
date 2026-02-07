@@ -181,6 +181,10 @@ class DHLService:
                 "value": 1
             },
         }
+
+        if payload["receiverId"] == "swe":
+            # remove customs details as dhl api is not accepting custom details for EEC (EU Customs Union) countries
+            del payload["customsDetails"]
         
         headers = {
             "accept": "application/json",
@@ -335,7 +339,8 @@ class LabelService:
                     customs_items.append({
                         "itemDescription": (item.product_title or "Return Item")[:50],
                         "packagedQuantity": item.return_quantity or 1,
-                        "itemValue": {"currency": str(amazon_return.currency_code or "EUR"), "value": float(price) if price > 0 else 0.0}
+                        "itemValue": {"currency": str(amazon_return.currency_code or "EUR"), "value": float(price) if price > 0 else 0.0},
+                        "itemWeight": {"uom": "kg", "value": 1}
                     })
             
             if not customs_items:

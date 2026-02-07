@@ -8,7 +8,7 @@ import logging
 from contextlib import contextmanager
 from typing import Generator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session, declarative_base
 
 from config import settings
@@ -76,7 +76,7 @@ def test_connection() -> bool:
     """Test database connection."""
     try:
         with get_session() as db:
-            db.execute("SELECT 1")
+            db.execute(text("SELECT 1"))
         logger.info(f"PostgreSQL connection successful: {settings.POSTGRES_URL.split('@')[1]}")
         return True
     except Exception as e:

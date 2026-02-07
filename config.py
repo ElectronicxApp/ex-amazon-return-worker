@@ -56,6 +56,15 @@ class Settings(BaseSettings):
     WORKER_POLL_INTERVAL: int = int(os.getenv("WORKER_POLL_INTERVAL", "10"))
     WORKER_DAYS_BACK: int = int(os.getenv("WORKER_DAYS_BACK", "90"))
     
+    # Retry Settings
+    RETRY_MAX_ATTEMPTS: int = int(os.getenv("RETRY_MAX_ATTEMPTS", "3"))
+    RETRY_WAIT_SECONDS: int = int(os.getenv("RETRY_WAIT_SECONDS", "60"))
+    RETRY_BACKOFF_MULTIPLIER: int = int(os.getenv("RETRY_BACKOFF_MULTIPLIER", "2"))
+
+    # Circuit Breaker Settings
+    CIRCUIT_BREAKER_THRESHOLD: int = int(os.getenv("CIRCUIT_BREAKER_THRESHOLD", "5"))
+    CIRCUIT_BREAKER_RESET_TIMEOUT: int = int(os.getenv("CIRCUIT_BREAKER_RESET_TIMEOUT", "300"))
+    
     # Schedule Settings (comma-separated times in HH:MM format)
     # Default: Run at 6:00 AM, 12:00 PM, and 6:00 PM
     WORKER_SCHEDULE_TIMES: str = os.getenv("WORKER_SCHEDULE_TIMES", "06:00,12:00,18:00")

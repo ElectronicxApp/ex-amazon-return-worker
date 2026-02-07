@@ -111,11 +111,11 @@ class ReturnFlow:
                 return summary
                 
             # Create services with session and retry handler
-            amazon_client = AmazonClient(session_manager, session)
+            amazon_client = AmazonClient(session)
             retry_handler = RetryWithSessionReset(session_manager, amazon_client)
             
-            fetch_service = FetchService(self.db, amazon_client, retry_handler)
-            address_service = AddressService(self.db, amazon_client, retry_handler)
+            fetch_service = FetchService(self.db, amazon_client)
+            address_service = AddressService(self.db, amazon_client)
             filter_service = FilterService(self.db)
             label_service = LabelService(self.db)
             upload_service = UploadService(self.db, amazon_client)
@@ -144,7 +144,8 @@ class ReturnFlow:
                 logger.error(f"Unexpected fetch error: {e}")
                 summary["steps"]["fetch"] = {"status": "error", "error": str(e)}
                 summary["errors"].append(f"Fetch step failed: {str(e)}")
-                
+   
+            
             # ============================================================
             # STEP 2: Fetch addresses
             # ============================================================
@@ -158,7 +159,7 @@ class ReturnFlow:
             except Exception as e:
                 logger.error(f"Address fetch error: {e}")
                 summary["steps"]["addresses"] = {"status": "error", "error": str(e)}
-                summary["errors"].append(f"Address step failed: {str(e)}")
+                summary["errors"].append(f"Address step failed: {str(e)}")    
                 
             # ============================================================
             # STEP 3: Perform RMA lookup and fetch order details from JTL
@@ -288,8 +289,8 @@ class ReturnFlow:
                     summary["errors"].append(f"RMA lookup failed: {str(e)}")
             else:
                 logger.info("No returns need RMA lookup")
-                summary["steps"]["rma_lookup"] = {"status": "skipped", "total": 0}
-            
+                summary["steps"]["rma_lookup"] = {"status": "skipped", "total": 0}     
+
             # ============================================================
             # STEP 3.5: Mark completed and already-labelled returns
             # ============================================================
@@ -353,7 +354,6 @@ class ReturnFlow:
                 logger.error(f"Filter error: {e}")
                 summary["steps"]["filter"] = {"status": "error", "error": str(e)}
                 eligible_returns = []
-
 
             # ============================================================
             # STEP 6: Generate DHL labels

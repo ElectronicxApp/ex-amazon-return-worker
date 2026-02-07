@@ -103,64 +103,89 @@ class FilterService:
         
     def detect_duplicates(self) -> Tuple[int, int]:
         """
-        Detect and mark duplicate returns.
-        Same order_id + ASIN → keep oldest, mark others as DUPLICATE_CLOSED.
+        Detect and mark duplicate returns using optimized SQL queries.
         
-        Returns (groups_found, duplicates_marked).
+        A return is a duplicate if ANY of its (order_id, asin) pairs already exist
+        in an OLDER return (based on return_request_date).
+        
+        Logic:
+        1. For each return to check (NO_RMA_FOUND, RMA_RECEIVED)
+        2. Check if any of its (order_id, asin) pairs exist in an older return
+        3. Older returns include ALL statuses EXCEPT DUPLICATE_CLOSED and NOT_ELIGIBLE
+        4. If duplicate found, mark as DUPLICATE_CLOSED
+        
+        Returns (duplicates_found, duplicates_marked).
         """
+        from sqlalchemy import and_
+        from sqlalchemy.orm import aliased
+        
         logger.info("Detecting duplicate returns...")
         
-        # Build map: (order_id, asin) -> [returns]
-        order_asin_map: Dict[Tuple[str, str], List[AmazonReturn]] = defaultdict(list)
-        
-        # Get all returns that haven't been closed
-        returns = self.db.query(AmazonReturn).filter(
+        # Get all returns to check for duplicates
+        returns_to_check = self.db.query(AmazonReturn).filter(
             AmazonReturn.internal_status.in_([
                 InternalStatus.NO_RMA_FOUND,
                 InternalStatus.RMA_RECEIVED,
             ])
         ).all()
         
-        for ret in returns:
-            for item in ret.items:
-                key = (ret.order_id, item.asin)
-                order_asin_map[key].append(ret)
-                
-        groups_found = 0
-        duplicates_marked = 0
-        ids_to_keep: Set[str] = set()
+        logger.info(f"Checking {len(returns_to_check)} returns for duplicates")
         
-        for (order_id, asin), group in order_asin_map.items():
-            if len(group) <= 1:
-                continue
+        duplicates_marked = 0
+        duplicate_groups = set()
+        
+        for ret in returns_to_check:
+            # Check each ASIN in this return
+            is_duplicate = False
+            duplicate_of = None
+            duplicate_asin = None
+            
+            for item in ret.items:
+                # Find if there's an older return with same (order_id, asin)
+                older_return = (
+                    self.db.query(AmazonReturn)
+                    .join(AmazonReturnItem)
+                    .filter(
+                        AmazonReturn.order_id == ret.order_id,
+                        AmazonReturnItem.asin == item.asin,
+                        AmazonReturn.id != ret.id,
+                        AmazonReturn.return_request_date <= ret.return_request_date,
+                        AmazonReturn.internal_status.notin_([
+                            InternalStatus.DUPLICATE_CLOSED
+                        ])
+                    )
+                    .order_by(AmazonReturn.return_request_date)
+                    .first()
+                )
                 
-            groups_found += 1
+                if older_return:
+                    is_duplicate = True
+                    duplicate_of = older_return
+                    duplicate_asin = item.asin
+                    duplicate_groups.add((ret.order_id, item.asin))
+                    break
             
-            # Sort by return_request_date (oldest first)
-            group.sort(key=lambda x: x.return_request_date or datetime.max)
-            
-            # Keep the oldest
-            oldest = group[0]
-            ids_to_keep.add(oldest.return_request_id)
-            
-            logger.info(f"Duplicate group [{order_id}, {asin}]: keeping {oldest.return_request_id}")
-            
-            # Mark others as duplicate and delete their order details
-            for ret in group[1:]:
-                if ret.return_request_id not in ids_to_keep:
-                    # Delete order details for this duplicate (same data as original)
-                    self._delete_order_details(ret.id)
-                    
-                    ret.internal_status = InternalStatus.DUPLICATE_CLOSED
-                    ret.last_error = f"Duplicate of {oldest.return_request_id}"
-                    duplicates_marked += 1
-                    logger.info(f"  Marked as duplicate: {ret.return_request_id}")
-                    
+            if is_duplicate and duplicate_of:
+                # Delete order details for this duplicate
+                self._delete_order_details(ret.id)
+                
+                # Mark as duplicate
+                ret.internal_status = InternalStatus.DUPLICATE_CLOSED
+                ret.last_error = f"ASIN {duplicate_asin} already in {duplicate_of.return_request_id}"
+                duplicates_marked += 1
+                
+                logger.info(
+                    f"Marked as duplicate: {ret.return_request_id} "
+                    f"(order_id={ret.order_id}, asin={duplicate_asin}) -> "
+                    f"duplicate of {duplicate_of.return_request_id}"
+                )
+        
         self.db.commit()
-
-        logger.info(f"Duplicate detection: {groups_found} groups, {duplicates_marked} marked")
-        return groups_found, duplicates_marked
+        
+        logger.info(f"Duplicate detection: {len(duplicate_groups)} groups, {duplicates_marked} marked")
+        return len(duplicate_groups), duplicates_marked
     
+
     def _delete_order_details(self, return_id: int):
         """
         Delete all order details for a return.

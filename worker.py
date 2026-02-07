@@ -290,7 +290,9 @@ class AmazonReturnWorker:
 
 def signal_handler(signum, frame):
     """Handle shutdown signals."""
-    logger.info(f"Received signal {signum}, shutting down...")
+    # Use print instead of logger to avoid reentrant call issues
+    print(f"\nReceived signal {signum}, shutting down...")
+    worker.stop()
     
 
 def main():
