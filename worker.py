@@ -139,10 +139,53 @@ class AmazonReturnWorker:
                 event.error_message = error[:500] if error else None
                 if result:
                     event.result = result
+                # Set progress to 100% on completion
+                if not error:
+                    event.current_step_index = event.total_steps
+                    event.current_step = "completed"
                 db.commit()
                 
                 status = "❌ FAILED" if error else "✅ COMPLETED"
                 logger.info(f"Event {event_id}: {status}")
+    
+    def update_event_progress(self, event_id: int, step_name: str, step_index: int, details: Dict = None):
+        """
+        Update queue event with current step progress.
+        
+        Called by ReturnFlow at each processing step to update real-time status.
+        
+        Args:
+            event_id: Queue event ID (0 for scheduled runs, ignored)
+            step_name: Current step name (e.g., "fetch_returns")
+            step_index: Current step index (0-9)
+            details: Optional step-specific details (e.g., {"total": 100, "new": 5})
+        """
+        from models.worker_queue import WorkerQueueEvent
+        
+        if event_id == 0:
+            # Scheduled run, no event to update
+            return
+        
+        try:
+            with self.get_session() as db:
+                event = db.query(WorkerQueueEvent).filter(
+                    WorkerQueueEvent.id == event_id
+                ).first()
+                
+                if event:
+                    event.current_step = step_name
+                    event.current_step_index = step_index
+                    
+                    if details:
+                        # Merge with existing step_progress
+                        step_progress = event.step_progress or {}
+                        step_progress[step_name] = details
+                        event.step_progress = step_progress
+                    
+                    db.commit()
+                    logger.debug(f"Progress: Step {step_index}/{event.total_steps} - {step_name}")
+        except Exception as e:
+            logger.warning(f"Failed to update progress: {e}")
     
     async def run_processing_cycle(self, days_back: int = None, event_id: int = 0) -> Dict[str, Any]:
         """
@@ -166,8 +209,12 @@ class AmazonReturnWorker:
         try:
             from services.return_flow import ReturnFlow
             
+            # Create progress callback bound to this event
+            def progress_callback(step_name: str, step_index: int, details: Dict = None):
+                self.update_event_progress(event_id, step_name, step_index, details)
+            
             with self.get_session() as db:
-                flow = ReturnFlow(db)
+                flow = ReturnFlow(db, progress_callback=progress_callback)
                 result = await flow.run_cycle(days_back=days)
             
             self.mark_complete(event_id, result=result)
