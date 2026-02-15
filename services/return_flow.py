@@ -37,6 +37,7 @@ from services.upload_service import UploadService
 from services.aggregation_service import AggregationService
 from services.retry_handler import RetryWithSessionReset
 from services.jtl_service import jtl_service
+from services.dhl_tracking_service import DHLTrackingService
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -431,16 +432,32 @@ class ReturnFlow:
                 logger.error(f"Label upload error: {e}")
                 summary["steps"]["label_upload"] = {"status": "error", "error": str(e)}
                 summary["errors"].append(f"Label upload failed: {str(e)}")
+
+            # ============================================================
+            # STEP 9: Update DHL Tracking
+            # ============================================================
+            logger.info("Step 9: Updating DHL tracking data...")
+            self._update_progress("update_tracking", 9)
+
+            try:
+                tracking_service = DHLTrackingService(self.db)
+                tracking_result = tracking_service.update_all_tracking()
+                summary["steps"]["tracking"] = tracking_result
+                self._update_progress("update_tracking", 9, tracking_result)
+            except Exception as e:
+                logger.error(f"Tracking step error: {e}", exc_info=True)
+                summary["steps"]["tracking"] = {"status": "error", "error": str(e)}
+                summary["errors"].append(f"Tracking update failed: {str(e)}")
                 
             # ============================================================
-            # STEP 9: Update statistics
+            # STEP 10: Update statistics
             # ============================================================
-            logger.info("Step 9: Updating statistics...")
-            self._update_progress("aggregation", 9)
+            logger.info("Step 10: Updating statistics...")
+            self._update_progress("aggregation", 10)
             try:
                 agg_service.aggregate_all(days=days_back)
                 summary["steps"]["aggregation"] = {"status": "success"}
-                self._update_progress("aggregation", 9, {"status": "completed"})
+                self._update_progress("aggregation", 10, {"status": "completed"})
             except Exception as e:
                 logger.error(f"Aggregation error: {e}")
                 summary["steps"]["aggregation"] = {"status": "error", "error": str(e)}

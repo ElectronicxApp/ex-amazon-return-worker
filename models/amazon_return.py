@@ -144,6 +144,7 @@ class AmazonReturn(Base):
     address = relationship("AmazonReturnAddress", back_populates="amazon_return", uselist=False, cascade="all, delete-orphan")
     amazon_label = relationship("AmazonReturnLabel", back_populates="amazon_return", uselist=False, cascade="all, delete-orphan")
     generated_label = relationship("AmazonReturnGeneratedLabel", back_populates="amazon_return", uselist=False, cascade="all, delete-orphan")
+    tracking_data = relationship("DHLTrackingData", back_populates="amazon_return", uselist=False, cascade="all, delete-orphan")
     
     def compute_hash(self) -> str:
         """Compute MD5 hash of raw_data for change detection."""

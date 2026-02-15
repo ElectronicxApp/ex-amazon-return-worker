@@ -141,7 +141,7 @@ class AmazonReturnWorker:
                     event.result = result
                 # Set progress to 100% on completion
                 if not error:
-                    event.current_step_index = event.total_steps
+                    event.current_step_index = event.total_steps - 1
                     event.current_step = "completed"
                 db.commit()
                 

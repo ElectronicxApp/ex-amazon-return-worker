@@ -12,3 +12,6 @@ from models.order_details import (
 from models.statistics import (
     ReturnStatistics, MarketplaceStats, ReasonStats, TopProduct
 )
+from models.dhl_tracking import (
+    DHLTrackingData, DHLTrackingEvent, DHLTrackingSignature
+)
