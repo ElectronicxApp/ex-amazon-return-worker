@@ -17,6 +17,7 @@ Key design decisions:
 """
 
 import logging
+import time
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Set, Tuple
 
@@ -33,6 +34,12 @@ logger = logging.getLogger(__name__)
 
 # Max age in days before tracking is considered expired (same as DHL)
 MAX_TRACKING_AGE_DAYS = 60
+
+# Rate limiting settings for DPD public API
+DPD_REQUEST_DELAY = 1.5  # seconds between requests
+DPD_MAX_RETRIES = 3  # max retry attempts for rate limit errors
+DPD_RETRY_BACKOFF = 2.0  # exponential backoff multiplier
+DPD_INITIAL_RETRY_DELAY = 5.0  # initial delay on first retry (seconds)
 
 # DPD status codes indicating delivery (from DPD docs section 6.1.4)
 # statusCode "13" = delivered (to consignee or returned to sender)
@@ -166,8 +173,13 @@ class DPDTrackingService:
         )
 
         # Step 3: fetch and process one at a time (DPD public API = one parcel per request)
-        for tn in trackable:
+        for idx, tn in enumerate(trackable):
             rid = return_tracking_map[tn]
+            
+            # Add delay between requests to avoid rate limiting (skip for first request)
+            if idx > 0:
+                time.sleep(DPD_REQUEST_DELAY)
+            
             summary["api_calls"] += 1
 
             try:
@@ -270,34 +282,57 @@ class DPDTrackingService:
     def _fetch_tracking_info(self, tracking_number: str) -> Optional[Dict]:
         """
         Fetch tracking data for a single DPD parcel via public REST API.
-
-        Returns parsed response dict or None on failure.
+        
+        Implements retry logic with exponential backoff for rate limit errors (429).
+        Returns parsed response dict or None on permanent failure.
         """
         url = f"{self.BASE_URL}/{tracking_number}"
+        
+        for attempt in range(DPD_MAX_RETRIES):
+            try:
+                response = requests.get(
+                    url,
+                    headers={
+                        "Accept": "application/json",
+                        "User-Agent": "DPD-Tracking-Service/1.0",
+                    },
+                    timeout=30,
+                )
 
-        try:
-            response = requests.get(
-                url,
-                headers={
-                    "Accept": "application/json",
-                    "User-Agent": "DPD-Tracking-Service/1.0",
-                },
-                timeout=30,
-            )
+                if response.status_code == 200:
+                    data = response.json()
+                    return self._parse_response(data, tracking_number)
+                
+                # Handle rate limiting with retry
+                elif response.status_code == 429:
+                    if attempt < DPD_MAX_RETRIES - 1:
+                        retry_delay = DPD_INITIAL_RETRY_DELAY * (DPD_RETRY_BACKOFF ** attempt)
+                        logger.warning(
+                            f"DPD API rate limit (429) for {tracking_number}, "
+                            f"retry {attempt + 1}/{DPD_MAX_RETRIES} after {retry_delay:.1f}s"
+                        )
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        logger.error(
+                            f"DPD API rate limit (429) for {tracking_number}, "
+                            f"max retries ({DPD_MAX_RETRIES}) exceeded"
+                        )
+                        return None
+                
+                # Other HTTP errors - no retry
+                else:
+                    logger.error(f"DPD API error for {tracking_number}: HTTP {response.status_code}")
+                    return None
 
-            if response.status_code != 200:
-                logger.error(f"DPD API error for {tracking_number}: HTTP {response.status_code}")
+            except requests.exceptions.RequestException as exc:
+                logger.error(f"DPD API request failed for {tracking_number}: {exc}")
                 return None
-
-            data = response.json()
-            return self._parse_response(data, tracking_number)
-
-        except requests.exceptions.RequestException as exc:
-            logger.error(f"DPD API request failed for {tracking_number}: {exc}")
-            return None
-        except Exception as exc:
-            logger.error(f"DPD response parse error for {tracking_number}: {exc}")
-            return None
+            except Exception as exc:
+                logger.error(f"DPD response parse error for {tracking_number}: {exc}")
+                return None
+        
+        return None
 
     # ------------------------------------------------------------------
     # Response parsing
@@ -604,9 +639,14 @@ class DPDTrackingService:
         
         We re-fetch the tracking data to get fresh links (they may contain
         expiring tokens). This is the one-time POD retrieval.
+        Includes retry logic for rate limiting.
         """
         try:
             url = f"{self.BASE_URL}/{tracking_number}"
+            
+            # Add small delay before POD fetch to avoid rate limiting
+            time.sleep(0.5)
+            
             response = requests.get(
                 url,
                 headers={
@@ -615,6 +655,11 @@ class DPDTrackingService:
                 },
                 timeout=30,
             )
+            
+            if response.status_code == 429:
+                logger.warning(f"Rate limit hit during POD fetch for {tracking_number}, skipping POD retrieval")
+                return None
+            
             if response.status_code != 200:
                 return None
 

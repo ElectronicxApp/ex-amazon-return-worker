@@ -299,6 +299,28 @@ class UploadService:
                 if new_state:
                     amazon_return.return_request_state = new_state
                     logger.info(f"[Upload] ✅ Updated return state to: {new_state}")
+                
+                # Update AmazonReturnLabel if labelDetails present
+                label_details = ret_data.get('labelDetails')
+                if label_details:
+                    if amazon_return.amazon_label:
+                        # Update existing label
+                        amazon_return.amazon_label.label_type = label_details.get("labelType")
+                        amazon_return.amazon_label.carrier_name = label_details.get("carrierName")
+                        amazon_return.amazon_label.carrier_tracking_id = label_details.get("carrierTrackingId")
+                        amazon_return.amazon_label.label_price = float(label_details.get("labelPrice") or 0)
+                        logger.info(f"[Upload] ✅ Updated AmazonReturnLabel: carrier={label_details.get('carrierName')}, tracking={label_details.get('carrierTrackingId')}")
+                    else:
+                        # Create new label if doesn't exist
+                        new_label = AmazonReturnLabel(
+                            return_id=amazon_return.id,
+                            label_type=label_details.get("labelType"),
+                            carrier_name=label_details.get("carrierName"),
+                            carrier_tracking_id=label_details.get("carrierTrackingId"),
+                            label_price=float(label_details.get("labelPrice") or 0),
+                        )
+                        self.db.add(new_label)
+                        logger.info(f"[Upload] ✅ Created AmazonReturnLabel: carrier={label_details.get('carrierName')}, tracking={label_details.get('carrierTrackingId')}")
             
             self.db.flush()
             
