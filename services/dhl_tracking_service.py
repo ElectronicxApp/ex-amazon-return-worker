@@ -10,19 +10,26 @@ Key design decisions:
 - Batch queries: up to 20 tracking numbers per API call (semicolon-separated).
 - Signatures use d-get-signature XML API. Returned as hex-encoded GIF in XML.
   Converted to binary bytes for DB storage.
-- Tracking is always enabled. Max tracking age is a constant 90 days.
-- Only amazon_label carrier_tracking_id is queried (Amazon updates it after upload).
+- Only DHL carriers are tracked (filtered by carrier_name on amazon_return_labels).
+- DHL reuses tracking numbers. We key records by (tracking_number, return_id).
+- Events are updated incrementally (no delete-and-replace) to avoid data loss
+  when a refetch returns empty.
+- Max tracking age: 60 days. After that, state becomes 'expired'.
+- First API failure → state becomes 'no_data' (immediate, no retries).
+- Proof of delivery (signature) is attempted once for all delivered shipments
+  (all returns ship to Germany).
 """
 
 import logging
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set, Tuple
 
 
 import requests
 from requests.auth import HTTPBasicAuth
 import xml.etree.ElementTree as ET
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
 
 from models.amazon_return import AmazonReturn, AmazonReturnLabel
@@ -33,7 +40,7 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 # Max age in days before tracking is considered expired
-MAX_TRACKING_AGE_DAYS = 90
+MAX_TRACKING_AGE_DAYS = 60
 
 # Max tracking numbers per batch API call (DHL limit)
 BATCH_SIZE = 20
@@ -81,12 +88,12 @@ class DHLTrackingService:
 
     def update_all_tracking(self) -> Dict[str, Any]:
         """
-        Main entry point: update tracking for all eligible returns.
+        Main entry point: update tracking for all eligible DHL returns.
 
-        1. Query returns with amazon_label carrier_tracking_id that are still active.
+        1. Query returns with DHL carrier_tracking_id that are still active.
         2. Collect tracking numbers, skip already-stopped ones.
         3. Batch-fetch from DHL in groups of 20.
-        4. Process & store results; fetch signatures for delivered DE shipments.
+        4. Process & store results; fetch signatures for delivered shipments.
         5. Commit and return summary.
 
         Returns:
@@ -97,6 +104,7 @@ class DHLTrackingService:
             "total": 0,
             "updated": 0,
             "failed": 0,
+            "no_data": 0,
             "skipped": 0,
             "batch_api_calls": 0,
         }
@@ -105,16 +113,19 @@ class DHLTrackingService:
             summary["status"] = "not_configured"
             return summary
 
-        # Step 1: get return_ids with active tracking needs
+        # Step 1: get return_ids with active DHL tracking needs
         return_ids = self._get_returns_to_track()
         summary["total"] = len(return_ids)
-        logger.info(f"Found {len(return_ids)} returns to track")
+        logger.info(f"Found {len(return_ids)} DHL returns to track")
 
         if not return_ids:
             return summary
 
         # Step 2: collect tracking numbers per return
+        # Maps (tracking_number, return_id) -> return_id for unique keying
         return_tracking_map: Dict[str, int] = {}  # tracking_number -> return_id
+        duplicate_tracking_numbers = 0
+
         for rid in return_ids:
             amazon_return = (
                 self.db.query(AmazonReturn)
@@ -125,28 +136,45 @@ class DHLTrackingService:
                 summary["skipped"] += 1
                 continue
 
-            tn = None
-            if amazon_return.amazon_label and amazon_return.amazon_label.carrier_tracking_id:
-                tn = amazon_return.amazon_label.carrier_tracking_id
-
-            if not tn:
+            # Secondary DHL guard — only track DHL carriers
+            if not amazon_return.amazon_label or not amazon_return.amazon_label.carrier_tracking_id:
                 summary["skipped"] += 1
                 continue
 
-            # Check if we should still track this
+            carrier = (amazon_return.amazon_label.carrier_name or "").strip().upper()
+            if not carrier.startswith("DHL"):
+                summary["skipped"] += 1
+                logger.debug(f"Skipping non-DHL carrier '{carrier}' for return {rid}")
+                continue
+
+            tn = amazon_return.amazon_label.carrier_tracking_id
+
+            # Check if we should still track this (using return_id-scoped lookup)
             existing = (
                 self.db.query(DHLTrackingData)
-                .filter(DHLTrackingData.tracking_number == tn)
+                .filter(
+                    DHLTrackingData.tracking_number == tn,
+                    DHLTrackingData.return_id == rid,
+                )
                 .first()
             )
             if existing and not self._should_track(existing):
                 summary["skipped"] += 1
                 continue
 
+            # Track duplicates: multiple returns with same tracking number
+            if tn in return_tracking_map:
+                duplicate_tracking_numbers += 1
+                logger.debug(f"Duplicate tracking number {tn}: return {rid} (already mapped to return {return_tracking_map[tn]})")
+                continue
+            
             return_tracking_map[tn] = rid
 
         trackable = list(return_tracking_map.keys())
-        logger.info(f"Trackable shipments: {len(trackable)} (skipped: {summary['skipped']})")
+        logger.info(
+            f"Trackable shipments: {len(trackable)} unique tracking numbers "
+            f"(skipped: {summary['skipped']}, duplicates: {duplicate_tracking_numbers})"
+        )
 
         # Step 3 & 4: batch-fetch and process
         for i in range(0, len(trackable), BATCH_SIZE):
@@ -158,7 +186,12 @@ class DHLTrackingService:
                 batch_results = self._fetch_tracking_batch(batch)
             except Exception as exc:
                 logger.error(f"Batch fetch error: {exc}")
-                summary["failed"] += len(batch)
+                # Mark all in batch as no_data
+                for tn in batch:
+                    rid = return_tracking_map.get(tn)
+                    if rid:
+                        self._mark_no_data(tn, rid)
+                        summary["no_data"] += 1
                 continue
 
             for tn, api_response in batch_results.items():
@@ -167,15 +200,18 @@ class DHLTrackingService:
                     continue
                 try:
                     if api_response is None:
-                        summary["failed"] += 1
+                        self._mark_no_data(tn, rid)
+                        summary["no_data"] += 1
                         continue
 
                     ok = self._process_tracking_data(tn, rid, api_response)
                     if ok:
                         summary["updated"] += 1
-                        self._maybe_fetch_signature(tn)
+                        self._maybe_fetch_signature(tn, rid)
                     else:
-                        summary["failed"] += 1
+                        # _process_tracking_data returned False → no shipment data
+                        # Already marked as no_data inside _process_tracking_data
+                        summary["no_data"] += 1
                 except Exception as exc:
                     logger.error(f"Tracking error for {tn} (return {rid}): {exc}")
                     summary["failed"] += 1
@@ -183,7 +219,8 @@ class DHLTrackingService:
         self.db.commit()
         logger.info(
             f"Tracking update complete: {summary['updated']} updated, "
-            f"{summary['failed']} failed, {summary['skipped']} skipped, "
+            f"{summary['no_data']} no_data, {summary['failed']} failed, "
+            f"{summary['skipped']} skipped, "
             f"{summary['batch_api_calls']} API calls (batch of {BATCH_SIZE})"
         )
         return summary
@@ -195,6 +232,7 @@ class DHLTrackingService:
     def update_tracking_for_return(self, return_id: int) -> Dict[str, Any]:
         """
         Update tracking for a single return (used by API endpoints).
+        Only tracks DHL carriers.
         """
         result: Dict[str, Any] = {"return_id": return_id, "status": "skipped", "tracking_number": None}
 
@@ -207,19 +245,25 @@ class DHLTrackingService:
             result["status"] = "not_found"
             return result
 
-        tracking_number = None
-        if amazon_return.amazon_label and amazon_return.amazon_label.carrier_tracking_id:
-            tracking_number = amazon_return.amazon_label.carrier_tracking_id
-
-        if not tracking_number:
+        if not amazon_return.amazon_label or not amazon_return.amazon_label.carrier_tracking_id:
             result["status"] = "no_tracking_number"
             return result
 
+        # Only track DHL carriers
+        carrier = (amazon_return.amazon_label.carrier_name or "").strip().upper()
+        if not carrier.startswith("DHL"):
+            result["status"] = "not_dhl_carrier"
+            return result
+
+        tracking_number = amazon_return.amazon_label.carrier_tracking_id
         result["tracking_number"] = tracking_number
 
         existing = (
             self.db.query(DHLTrackingData)
-            .filter(DHLTrackingData.tracking_number == tracking_number)
+            .filter(
+                DHLTrackingData.tracking_number == tracking_number,
+                DHLTrackingData.return_id == return_id,
+            )
             .first()
         )
         if existing and not self._should_track(existing):
@@ -229,23 +273,28 @@ class DHLTrackingService:
 
         api_response = self._fetch_tracking_info(tracking_number)
         if not api_response:
-            result["status"] = "api_error"
+            self._mark_no_data(tracking_number, return_id)
+            result["status"] = "no_data"
             return result
 
         ok = self._process_tracking_data(tracking_number, return_id, api_response)
         if not ok:
-            result["status"] = "processing_error"
+            # _process_tracking_data already marks no_data internally
+            result["status"] = "no_data"
             return result
 
         td = (
             self.db.query(DHLTrackingData)
-            .filter(DHLTrackingData.tracking_number == tracking_number)
+            .filter(
+                DHLTrackingData.tracking_number == tracking_number,
+                DHLTrackingData.return_id == return_id,
+            )
             .first()
         )
         result["status"] = "updated"
         result["tracking_state"] = td.tracking_state if td else "unknown"
 
-        self._maybe_fetch_signature(tracking_number)
+        self._maybe_fetch_signature(tracking_number, return_id)
         return result
 
     # ------------------------------------------------------------------
@@ -582,16 +631,26 @@ class DHLTrackingService:
         Store/update tracking data & events in database.
 
         No ICE/RIC enrichment here — that is frontend-only via dhlEventCodes.ts.
+
+        Events are updated incrementally: new events are inserted, existing ones
+        are left untouched. This prevents data loss when a refetch returns empty.
+
+        If the API response contains no shipment data, marks the record as 'no_data'.
         """
         try:
             shipment = api_response.get("shipment")
             if not shipment:
                 logger.warning(f"No shipment data in API response for {tracking_number}")
+                self._mark_no_data(tracking_number, return_id)
                 return False
 
+            # Lookup by (tracking_number, return_id) — supports DHL tracking number reuse
             tracking_data = (
                 self.db.query(DHLTrackingData)
-                .filter(DHLTrackingData.tracking_number == tracking_number)
+                .filter(
+                    DHLTrackingData.tracking_number == tracking_number,
+                    DHLTrackingData.return_id == return_id,
+                )
                 .first()
             )
 
@@ -600,12 +659,16 @@ class DHLTrackingService:
             ice_code = shipment.get("ice")
 
             if tracking_data is None:
+                # Use the earliest event timestamp as tracking start time
+                first_event_ts = self._get_earliest_event_ts(api_response.get("events", []))
                 tracking_data = DHLTrackingData(
                     tracking_number=tracking_number,
                     return_id=return_id,
-                    tracking_started_at=datetime.utcnow(),
+                    carrier="DHL",
+                    tracking_started_at=first_event_ts or datetime.utcnow(),
                 )
                 self.db.add(tracking_data)
+                self.db.flush()  # get id assigned
 
             # Update shipment-level fields
             tracking_data.current_status = shipment.get("status")
@@ -633,15 +696,29 @@ class DHLTrackingService:
                 tracking_data.tracking_stopped_at = datetime.utcnow()
             tracking_data.tracking_state = new_state
 
-            # Replace events
-            self.db.query(DHLTrackingEvent).filter(
-                DHLTrackingEvent.tracking_number == tracking_number
-            ).delete()
+            # --- Incremental event update ---
+            # Load existing event keys to avoid duplicates
+            existing_events: Set[Tuple] = set()
+            db_events = (
+                self.db.query(DHLTrackingEvent)
+                .filter(DHLTrackingEvent.tracking_data_id == tracking_data.id)
+                .all()
+            )
+            for ev in db_events:
+                key = (ev.event_timestamp, ev.ice_code, ev.ric_code, ev.event_sequence)
+                existing_events.add(key)
 
+            # Insert only new events
+            new_event_count = 0
             for evt in api_response.get("events", []):
+                evt_ts = self._parse_timestamp(evt.get("timestamp"))
+                evt_key = (evt_ts, evt.get("ice"), evt.get("ric"), evt.get("sequence", 0))
+                if evt_key in existing_events:
+                    continue  # already stored
                 self.db.add(DHLTrackingEvent(
+                    tracking_data_id=tracking_data.id,
                     tracking_number=tracking_number,
-                    event_timestamp=self._parse_timestamp(evt.get("timestamp")),
+                    event_timestamp=evt_ts,
                     event_status=evt.get("status"),
                     event_short_status=evt.get("short_status"),
                     ice_code=evt.get("ice"),
@@ -651,6 +728,10 @@ class DHLTrackingService:
                     event_country=evt.get("country"),
                     event_sequence=evt.get("sequence", 0),
                 ))
+                new_event_count += 1
+
+            if new_event_count:
+                logger.debug(f"Inserted {new_event_count} new events for {tracking_number}")
 
             self.db.flush()
             return True
@@ -659,11 +740,48 @@ class DHLTrackingService:
             logger.error(f"Error processing tracking data for {tracking_number}: {exc}", exc_info=True)
             return False
 
-    def _maybe_fetch_signature(self, tracking_number: str) -> None:
-        """Fetch & store signature if the shipment is delivered to DE and not yet retrieved."""
+    def _mark_no_data(self, tracking_number: str, return_id: int, carrier: str = "DHL") -> None:
+        """
+        Mark a tracking record as 'no_data' — API returned nothing.
+
+        Called on first failure; immediately closes tracking (no retries).
+        """
+        tracking_data = (
+            self.db.query(DHLTrackingData)
+            .filter(
+                DHLTrackingData.tracking_number == tracking_number,
+                DHLTrackingData.return_id == return_id,
+            )
+            .first()
+        )
+        if tracking_data is None:
+            tracking_data = DHLTrackingData(
+                tracking_number=tracking_number,
+                return_id=return_id,
+                carrier=carrier,
+                tracking_started_at=datetime.utcnow(),
+            )
+            self.db.add(tracking_data)
+
+        tracking_data.tracking_state = "no_data"
+        tracking_data.tracking_stopped_at = datetime.utcnow()
+        tracking_data.updated_at = datetime.utcnow()
+        self.db.flush()
+        logger.info(f"Marked {tracking_number} (return {return_id}) as no_data")
+
+    def _maybe_fetch_signature(self, tracking_number: str, return_id: int) -> None:
+        """
+        Fetch & store signature if the shipment is delivered and not yet retrieved.
+
+        All return shipments go to Germany, so the signature API is always applicable.
+        One attempt only — if it fails, signature_retrieval_failed is set to True.
+        """
         td = (
             self.db.query(DHLTrackingData)
-            .filter(DHLTrackingData.tracking_number == tracking_number)
+            .filter(
+                DHLTrackingData.tracking_number == tracking_number,
+                DHLTrackingData.return_id == return_id,
+            )
             .first()
         )
         if not td:
@@ -672,18 +790,19 @@ class DHLTrackingService:
             return
         if td.signature_retrieved or td.signature_retrieval_failed:
             return
-        if not td.dest_country or td.dest_country.upper() != "DE":
-            return
 
         sig_bytes = self._fetch_signature(tracking_number)
         if sig_bytes:
             sig = (
                 self.db.query(DHLTrackingSignature)
-                .filter(DHLTrackingSignature.tracking_number == tracking_number)
+                .filter(DHLTrackingSignature.tracking_data_id == td.id)
                 .first()
             )
             if not sig:
-                sig = DHLTrackingSignature(tracking_number=tracking_number)
+                sig = DHLTrackingSignature(
+                    tracking_data_id=td.id,
+                    tracking_number=tracking_number,
+                )
                 self.db.add(sig)
             sig.signature_image = sig_bytes
             sig.signature_date = td.delivery_date
@@ -702,8 +821,12 @@ class DHLTrackingService:
         """
         Query returns that need tracking updates.
 
-        Only queries amazon_label carrier_tracking_id — after label upload,
-        Amazon updates the return with the DHL tracking number.
+        Filters:
+        - Only DHL carriers (carrier_name ILIKE 'DHL%').
+        - Only returns with a carrier_tracking_id set.
+        - Only returns with no tracking record yet, or tracking_state == 'active'.
+
+        Join on return_id (not tracking_number) to support DHL tracking number reuse.
         No batch_size limit; we process all eligible returns each cycle.
         """
         rows = (
@@ -711,11 +834,12 @@ class DHLTrackingService:
             .join(AmazonReturnLabel, AmazonReturn.id == AmazonReturnLabel.return_id)
             .outerjoin(
                 DHLTrackingData,
-                AmazonReturnLabel.carrier_tracking_id == DHLTrackingData.tracking_number,
+                AmazonReturn.id == DHLTrackingData.return_id,
             )
             .filter(
                 AmazonReturnLabel.carrier_tracking_id.isnot(None),
-                (DHLTrackingData.tracking_number.is_(None)) | (DHLTrackingData.tracking_state == "active"),
+                func.upper(AmazonReturnLabel.carrier_name).like("DHL%"),
+                (DHLTrackingData.id.is_(None)) | (DHLTrackingData.tracking_state == "active"),
             )
             .all()
         )
@@ -740,7 +864,7 @@ class DHLTrackingService:
     @staticmethod
     def _should_track(tracking_data: DHLTrackingData) -> bool:
         """Return False if tracking should stop."""
-        if tracking_data.tracking_state in ("delivered", "expired"):
+        if tracking_data.tracking_state in ("delivered", "expired", "no_data"):
             return False
         if tracking_data.tracking_stopped_at is not None:
             return False
@@ -774,3 +898,12 @@ class DHLTrackingService:
             except ValueError:
                 continue
         return None
+
+    @classmethod
+    def _get_earliest_event_ts(cls, events: list) -> Optional[datetime]:
+        """Return the earliest event timestamp from a list of event dicts."""
+        if not events:
+            return None
+        timestamps = [cls._parse_timestamp(e.get("timestamp")) for e in events]
+        valid = [ts for ts in timestamps if ts is not None]
+        return min(valid) if valid else None

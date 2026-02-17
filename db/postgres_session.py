@@ -67,7 +67,7 @@ def get_db() -> Generator[Session, None, None]:
 
 def init_db():
     """Initialize database tables."""
-    from models import amazon_return, worker_queue, order_details, statistics
+    from models import amazon_return, worker_queue, order_details, statistics, dhl_tracking
     Base.metadata.create_all(bind=engine)
     logger.info("Database tables initialized")
 

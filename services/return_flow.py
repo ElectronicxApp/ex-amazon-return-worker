@@ -38,6 +38,7 @@ from services.aggregation_service import AggregationService
 from services.retry_handler import RetryWithSessionReset
 from services.jtl_service import jtl_service
 from services.dhl_tracking_service import DHLTrackingService
+from services.dpd_tracking_service import DPDTrackingService
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -448,7 +449,23 @@ class ReturnFlow:
                 logger.error(f"Tracking step error: {e}", exc_info=True)
                 summary["steps"]["tracking"] = {"status": "error", "error": str(e)}
                 summary["errors"].append(f"Tracking update failed: {str(e)}")
-                
+
+            # ============================================================
+            # STEP 9.5: Update DPD Tracking
+            # ============================================================
+            logger.info("Step 9.5: Updating DPD tracking data...")
+            self._update_progress("update_dpd_tracking", 9)
+
+            try:
+                dpd_service = DPDTrackingService(self.db)
+                dpd_result = dpd_service.update_all_tracking()
+                summary["steps"]["dpd_tracking"] = dpd_result
+                self._update_progress("update_dpd_tracking", 9, dpd_result)
+            except Exception as e:
+                logger.error(f"DPD tracking step error: {e}", exc_info=True)
+                summary["steps"]["dpd_tracking"] = {"status": "error", "error": str(e)}
+                summary["errors"].append(f"DPD tracking update failed: {str(e)}")
+
             # ============================================================
             # STEP 10: Update statistics
             # ============================================================

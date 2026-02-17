@@ -43,13 +43,19 @@ class AddressService:
         routing_data = await self.client.get_routing_details(**api_call_params)
         
         if not routing_data:
-            logger.warning(f"No routing details for {return_obj.order_id}")
+            logger.warning(f"No routing details for {return_obj.order_id} - marking as NOT_ELIGIBLE")
+            return_obj.internal_status = InternalStatus.NOT_ELIGIBLE
+            return_obj.last_error = "NO_ADDRESS"
+            self.db.commit()
             return False
             
         # Parse shipFromAddress
         ship_from = routing_data.get("shipFromAddress")
         if not ship_from:
-            logger.warning(f"No shipFromAddress in routing details for {return_obj.order_id}")
+            logger.warning(f"No shipFromAddress in routing details for {return_obj.order_id} - marking as NOT_ELIGIBLE")
+            return_obj.internal_status = InternalStatus.NOT_ELIGIBLE
+            return_obj.last_error = "NO_ADDRESS"
+            self.db.commit()
             return False
             
         # Create or update address
@@ -82,22 +88,27 @@ class AddressService:
         """
         Fetch addresses for all returns that don't have one.
         Returns count of addresses fetched.
+        Excludes returns already marked as NOT_ELIGIBLE to prevent infinite retries.
         """
-        # Get returns without addresses
+        # Get returns without addresses, excluding those already marked NOT_ELIGIBLE
         returns_without_address = self.db.query(AmazonReturn).filter(
             ~AmazonReturn.address.has(),
+            AmazonReturn.internal_status != InternalStatus.NOT_ELIGIBLE
         ).all()
         
         logger.info(f"Found {len(returns_without_address)} returns without addresses")
         
         fetched = 0
+        failed = 0
         for amazon_return in returns_without_address:
-            address = await self.fetch_address(amazon_return)
-            if address:
+            success = await self.fetch_address(amazon_return)
+            if success:
                 fetched += 1
+            else:
+                failed += 1
                 
             # Small delay to avoid rate limiting
             await asyncio.sleep(1)
             
-        logger.info(f"Fetched {fetched} addresses")
+        logger.info(f"Fetched {fetched} addresses, {failed} failed and marked as NOT_ELIGIBLE")
         return fetched
